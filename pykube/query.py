@@ -1,11 +1,12 @@
 import json
-
 from collections import namedtuple
-
 from urllib.parse import urlencode
 
-from .exceptions import ObjectDoesNotExist
+import aiohttp
 
+from ._syncasync import AsyncSyncMixin, SyncWrapper
+from .exceptions import ObjectDoesNotExist
+from .http import AsyncHTTPClient, SyncedHTTPClient
 
 all_ = object()
 everything = object()
@@ -34,9 +35,10 @@ class Table:
         return self.obj['rows']
 
 
-class BaseQuery:
+class AsyncQueryImpl:
 
     def __init__(self, api, api_obj_class, namespace=None):
+        super().__init__()
         self.api = api
         self.api_obj_class = api_obj_class
         self.namespace = namespace
@@ -83,10 +85,37 @@ class BaseQuery:
         query_string = urlencode(params)
         return "{}{}".format(self.api_obj_class.endpoint, "?{}".format(query_string) if query_string else "")
 
+    @property
+    def api(self):
+        """
+        Get an async client for async activities.
 
-class Query(BaseQuery):
+        In most cases, async methods are wrapped and put as the sync ones.
+        If such clients are used in the async methods, the event loop will
+        be blocked. Instead, the wrapped methods should use an async client
+        internally even if ``self`` is a sync object and a client is sync.
 
-    def get_by_name(self, name):
+        The sync client cannot be unwrapped on the creation, and should remain
+        sync -- in case some of real sync methods need the real sync client.
+
+        If a normal async client is passed (i.e. no wrapping is used),
+        it is used as is.
+        """
+        return self._api
+
+    @api.setter
+    def api(self, value):
+        self._api = value
+        if isinstance(value, AsyncHTTPClient):
+            self.sync_api = SyncedHTTPClient(value)
+            self.async_api = value
+        elif isinstance(value, SyncedHTTPClient):
+            self.sync_api = value
+            self.async_api = value.async_wrapped
+        else:
+            raise RuntimeError(f"API client type is not supported: {value!r}")
+
+    async def get_by_name(self, name):
         '''
         Get object by name, raises ObjectDoesNotExist if not found
         '''
@@ -98,19 +127,27 @@ class Query(BaseQuery):
             kwargs["base"] = self.api_obj_class.base
         if self.api_obj_class.version:
             kwargs["version"] = self.api_obj_class.version
-        r = self.api.get(**kwargs)
-        if not r.ok:
-            if r.status_code == 404:
+        r = await self.async_api.get(**kwargs)
+        try:
+            r.raise_for_status()
+        except aiohttp.ClientResponseError as e:
+            if e.status == 404:
                 raise ObjectDoesNotExist("{} does not exist.".format(name))
-            self.api.raise_for_status(r)
-        return self.api_obj_class(self.api, r.json())
+            else:
+                raise
+        # if not r.ok:
+        #     if r.status_code == 404:
+        #         raise ObjectDoesNotExist("{} does not exist.".format(name))
+        #     self.api.raise_for_status(r)
+        data = await r.json()
+        return self.api_obj_class(self.api, data)
 
-    def get(self, *args, **kwargs):
+    async def get(self, *args, **kwargs):
         '''
         Get a single object by name, namespace, label, ..
         '''
         if "name" in kwargs:
-            return self.get_by_name(kwargs["name"])
+            return await self.get_by_name(kwargs["name"])
         clone = self.filter(*args, **kwargs)
         num = len(clone)
         if num == 1:
@@ -119,12 +156,12 @@ class Query(BaseQuery):
             raise ObjectDoesNotExist("get() returned zero objects")
         raise ValueError("get() more than one object; use filter")
 
-    def get_or_none(self, *args, **kwargs):
+    async def get_or_none(self, *args, **kwargs):
         '''
         Get object by name, return None if not found
         '''
         try:
-            return self.get(*args, **kwargs)
+            return await self.get(*args, **kwargs)
         except ObjectDoesNotExist:
             return None
 
@@ -137,7 +174,7 @@ class Query(BaseQuery):
             query.resource_version = since
         return query
 
-    def execute(self, **kwargs):
+    async def execute(self, **kwargs):
         kwargs["url"] = self._build_api_url()
         if self.api_obj_class.base:
             kwargs["base"] = self.api_obj_class.base
@@ -145,19 +182,19 @@ class Query(BaseQuery):
             kwargs["version"] = self.api_obj_class.version
         if self.namespace is not None and self.namespace is not all_:
             kwargs["namespace"] = self.namespace
-        r = self.api.get(**kwargs)
+        r = await self.async_api.get(**kwargs)
         r.raise_for_status()
         return r
 
-    def as_table(self) -> Table:
+    async def as_table(self) -> Table:
         """
         Execute query and return result as Table (similar to what kubectl does)
         See https://kubernetes.io/docs/reference/using-api/api-concepts/#receiving-resources-as-tables
         """
-        response = self.execute(headers={'Accept': 'application/json;as=Table;v=v1beta1;g=meta.k8s.io'})
-        return Table(self.api_obj_class, response.json())
+        response = await self.execute(headers={'Accept': 'application/json;as=Table;v=v1beta1;g=meta.k8s.io'})
+        return Table(self.api_obj_class, await response.json())
 
-    def iterator(self):
+    async def iterator(self):
         """
         Execute the API request and return an iterator over the objects. This
         method does not use the query cache.
@@ -165,62 +202,90 @@ class Query(BaseQuery):
         for obj in (self.execute().json().get("items") or []):
             yield self.api_obj_class(self.api, obj)
 
-    @property
-    def query_cache(self):
+    async def get_query_cache(self):
         if not hasattr(self, "_query_cache"):
             cache = {"objects": []}
-            cache["response"] = self.execute().json()
+            response = await self.execute()
+            result = await response.json()
+            cache["response"] = result
             for obj in (cache["response"].get("items") or []):
                 cache["objects"].append(self.api_obj_class(self.api, obj))
             self._query_cache = cache
         return self._query_cache
 
+    @property  # return coro; specially handled in syncasync converter.
+    async def response(self):
+        cache = await self.get_query_cache()
+        return cache["response"]
+
     def __len__(self):
-        return len(self.query_cache["objects"])
+        # FIXME: same sync problem as .response
+        return len(self.get_query_cache()["objects"])
 
-    def __iter__(self):
-        return iter(self.query_cache["objects"])
-
-    @property
-    def response(self):
-        return self.query_cache["response"]
+    def __aiter__(self):
+        # TODO: make it an async iter actually.
+        return iter(self.get_query_cache()["objects"])
 
 
-class WatchQuery(BaseQuery):
+class AsyncWatchQueryImpl(AsyncQueryImpl):
 
     def __init__(self, *args, **kwargs):
         self.resource_version = kwargs.pop("resource_version", None)
         self.params = None
-        super(WatchQuery, self).__init__(*args, **kwargs)
+        super().__init__(*args, **kwargs)
         self._response = None
 
-    def object_stream(self):
+    @property
+    def response(self):
+        return self._response
+
+    async def object_stream(self):
         params = dict(self.params or {})  # shallow clone for local use
         params["watch"] = "true"
         if self.resource_version is not None:
             params["resourceVersion"] = self.resource_version
         kwargs = {
             "url": self._build_api_url(params=params),
-            "stream": True,
+            # "stream": True,
         }
         if self.namespace is not all_:
             kwargs["namespace"] = self.namespace
         if self.api_obj_class.version:
             kwargs["version"] = self.api_obj_class.version
-        r = self.api.get(**kwargs)
-        self.api.raise_for_status(r)
+        r = await self.async_api.get(**kwargs)
+        await self.async_api.raise_for_status(r)
         self._response = r
         WatchEvent = namedtuple("WatchEvent", "type object")
-        for line in r.iter_lines():
-            we = json.loads(line.decode("utf-8"))
-            yield WatchEvent(type=we["type"], object=self.api_obj_class(self.api, we["object"]))
+        async with r:
+            async for line in r.content:
+                we = json.loads(line.decode("utf-8"))
+                yield WatchEvent(type=we["type"], object=self.api_obj_class(self.api, we["object"]))
 
-    def __iter__(self):
+    def __aiter__(self):
         return iter(self.object_stream())
 
-    @property
-    def response(self):
-        return self._response
+
+class SyncedQueryImpl(SyncWrapper, async_cls=AsyncQueryImpl):
+    pass
+
+
+class SyncedWatchQueryImpl(SyncWrapper, async_cls=AsyncWatchQueryImpl):
+    # TODO: SyncWatchQuery must have sync iterators! => def object_stream():
+    def __iter__(self):
+        itr = self.object_stream()
+        return iter(itr)
+
+
+# Backward compatibility: the class name as it was used in pre-async time.
+# Auto-decides on which implementation to actually use based on the API client.
+class Query(AsyncSyncMixin, async_impl=AsyncQueryImpl, synced_impl=SyncedQueryImpl):
+    pass
+
+
+# Backward compatibility: the class name as it was used in pre-async time.
+# Auto-decides on which implementation to actually use based on the API client.
+class WatchQuery(AsyncSyncMixin, async_impl=AsyncWatchQueryImpl, synced_impl=SyncedWatchQueryImpl):
+    pass
 
 
 def as_selector(value):

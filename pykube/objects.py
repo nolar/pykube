@@ -3,9 +3,11 @@ import json
 import os.path as op
 from inspect import getmro
 from typing import Type
-
 from urllib.parse import urlencode
+
+from ._syncasync import SyncWrapper, AsyncSyncMixin
 from .exceptions import ObjectDoesNotExist
+from .http import AsyncHTTPClient, SyncedHTTPClient
 from .mixins import ReplicatedMixin, ScalableMixin
 from .query import Query
 from .utils import obj_merge
@@ -23,7 +25,7 @@ class ObjectManager:
         return self
 
 
-class APIObject:
+class AsyncAPIObjectImpl:
     '''
     Baseclass for all Kubernetes API objects
     '''
@@ -33,6 +35,7 @@ class APIObject:
     namespace = None
 
     def __init__(self, api, obj):
+        super().__init__()
         self.api = api
         self.set_obj(obj)
 
@@ -41,10 +44,15 @@ class APIObject:
         self._original_obj = copy.deepcopy(obj)
 
     def __repr__(self):
-        return "<{kind} {name}>".format(kind=self.kind, name=self.name)
+        return "<{cls}(...)>".format(cls=self.__class__)
+        # return "<{kind} {name}>".format(kind=self.kind, name=self.name)
 
     def __str__(self):
         return self.name
+
+    @property
+    def kind(self) -> str:
+        return self.obj["kind"]
 
     @property
     def name(self) -> str:
@@ -102,10 +110,40 @@ class APIObject:
         kw.update(kwargs)
         return kw
 
-    def exists(self, ensure=False):
-        r = self.api.get(**self.api_kwargs())
+    @property
+    def api(self):
+        """
+        Get an async client for async activities.
+
+        In most cases, async methods are wrapped and put as the sync ones.
+        If such clients are used in the async methods, the event loop will
+        be blocked. Instead, the wrapped methods should use an async client
+        internally even if ``self`` is a sync object and a client is sync.
+
+        The sync client cannot be unwrapped on the creation, and should remain
+        sync -- in case some of real sync methods need the real sync client.
+
+        If a normal async client is passed (i.e. no wrapping is used),
+        it is used as is.
+        """
+        return self._api
+
+    @api.setter
+    def api(self, value):
+        self._api = value
+        if isinstance(value, AsyncHTTPClient):
+            self.sync_api = SyncedHTTPClient(value)
+            self.async_api = value
+        elif isinstance(value, SyncedHTTPClient):
+            self.sync_api = value
+            self.async_api = value.async_wrapped
+        else:
+            raise RuntimeError(f"API client type is not supported: {value!r}")
+
+    async def exists(self, ensure=False):
+        r = await self.async_api.get(**self.api_kwargs())
         if r.status_code not in {200, 404}:
-            self.api.raise_for_status(r)
+            await self.async_api.raise_for_status(r)
         if not r.ok:
             if ensure:
                 raise ObjectDoesNotExist("{} does not exist.".format(self.name))
@@ -113,43 +151,43 @@ class APIObject:
                 return False
         return True
 
-    def create(self):
-        r = self.api.post(**self.api_kwargs(data=json.dumps(self.obj), obj_list=True))
-        self.api.raise_for_status(r)
-        self.set_obj(r.json())
+    async def create(self):
+        r = await self.async_api.post(**self.api_kwargs(data=json.dumps(self.obj), obj_list=True))
+        await self.async_api.raise_for_status(r)
+        self.set_obj(await r.json())
 
-    def reload(self):
-        r = self.api.get(**self.api_kwargs())
-        self.api.raise_for_status(r)
-        self.set_obj(r.json())
+    async def reload(self):
+        r = await self.async_api.get(**self.api_kwargs())
+        await self.async_api.raise_for_status(r)
+        self.set_obj(await r.json())
 
-    def watch(self):
+    async def watch(self):
         return self.__class__.objects(
-            self.api,
+            self.async_api,
             namespace=self.namespace
         ).filter(field_selector={
             "metadata.name": self.name
         }).watch()
 
-    def patch(self, strategic_merge_patch):
+    async def patch(self, strategic_merge_patch):
         '''
         Patch the Kubernetes resource by calling the API with a "strategic merge" patch.
         '''
-        r = self.api.patch(**self.api_kwargs(
+        r = await self.async_api.patch(**self.api_kwargs(
             headers={"Content-Type": "application/merge-patch+json"},
             data=json.dumps(strategic_merge_patch),
         ))
-        self.api.raise_for_status(r)
-        self.set_obj(r.json())
+        await self.async_api.raise_for_status(r)
+        self.set_obj(await r.json())
 
-    def update(self):
+    async def update(self):
         '''
         Update the Kubernetes resource by calling the API (patch)
         '''
         self.obj = obj_merge(self.obj, self._original_obj)
-        self.patch(self.obj)
+        await self.patch(self.obj)
 
-    def delete(self, propagation_policy: str = None):
+    async def delete(self, propagation_policy: str = None):
         '''
         Delete the Kubernetes resource by calling the API.
 
@@ -160,11 +198,23 @@ class APIObject:
             options = {"propagationPolicy": propagation_policy}
         else:
             options = {}
-        r = self.api.delete(**self.api_kwargs(data=json.dumps(options)))
+        r = await self.async_api.delete(**self.api_kwargs(data=json.dumps(options)))
         if r.status_code != 404:
-            self.api.raise_for_status(r)
+            await self.async_api.raise_for_status(r)
 
 
+class SyncedAPIObjectImpl(SyncWrapper, async_cls=AsyncAPIObjectImpl):
+    pass
+
+
+# Backward compatibility: used as a base class in the hierarchy of k8s objects.
+# Auto-decides on which implementation to actually use based on the API client.
+class APIObject(AsyncSyncMixin, async_impl=AsyncAPIObjectImpl, synced_impl=SyncedAPIObjectImpl):
+    objects = ObjectManager()
+
+
+# Note: no specific sync/async implementation is needed. Otherwise,
+# a new sync/async definition and two impl classes would be needed.
 class NamespacedAPIObject(APIObject):
 
     @property
@@ -196,6 +246,7 @@ def object_factory(api, api_version, kind) -> Type[APIObject]:
     Currently, the HTTPClient passed to this function will not be bound to the returned type.
     It is planned to fix this, but in the mean time pass it as you would normally.
     """
+    # TODO: sync/async+await call!
     resource_list = api.resource_list(api_version)
     try:
         resource = next(resource for resource in resource_list["resources"] if resource["kind"] == kind)
@@ -243,6 +294,7 @@ class Deployment(NamespacedAPIObject, ReplicatedMixin, ScalableMixin):
             self.obj["status"]["updatedReplicas"] == self.replicas
         )
 
+    # TODO: sync/async impl!
     def rollout_undo(self, target_revision=None):
         """Produces same action as kubectl rollout undo deployment command.
         Input variable is revision to rollback to (in kubectl, --to-revision)
@@ -379,6 +431,7 @@ class Pod(NamespacedAPIObject):
         condition = next((c for c in cs if c["type"] == "Ready"), None)
         return condition is not None and condition["status"] == "True"
 
+    # TODO: sync/async impl!
     def logs(self, container=None, pretty=None, previous=False,
              since_seconds=None, since_time=None, timestamps=False,
              tail_lines=None, limit_bytes=None):
@@ -414,6 +467,7 @@ class Pod(NamespacedAPIObject):
             "namespace": self.namespace,
             "operation": log_call,
         }
+        # TODO: async/async+await!
         r = self.api.get(**self.api_kwargs(**kwargs))
         r.raise_for_status()
         return r.text

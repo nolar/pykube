@@ -6,7 +6,12 @@ __version__ = '0.28'
 
 from .config import KubeConfig  # noqa
 from .exceptions import KubernetesError, PyKubeError, ObjectDoesNotExist  # noqa
-from .http import HTTPClient  # noqa
+from .http import (
+    AioHTTPClient,
+    AsyncHTTPClient,
+    SyncedHTTPClient,
+    HTTPClient,
+)
 from .objects import (  # noqa
     object_factory,
     ConfigMap,

@@ -16,7 +16,7 @@ with open("README.rst") as fp:
     long_description = fp.read()
 
 install_requires = [
-    "requests>=2.12",
+    "aiohttp",
     "PyYAML"
 ]
 

@@ -1,12 +1,14 @@
 """
 HTTP request related code.
 """
-
-import datetime
-import json
+import abc
+import asyncio
 import posixpath
-import shlex
-import subprocess
+import ssl
+import threading
+from typing import Optional
+
+import aiohttp
 
 try:
     import google.auth
@@ -15,159 +17,28 @@ try:
 except ImportError:
     google_auth_installed = False
 
-import requests.adapters
-
-from http import HTTPStatus
 from urllib.parse import urlparse
 
+from ._syncasync import SyncWrapper
 from .exceptions import HTTPError
-from .utils import jsonpath_installed, jsonpath_parse
 from .config import KubeConfig
 
-from . import __version__
-
-DEFAULT_HTTP_TIMEOUT = 10  # seconds
+DEFAULT_HTTP_TIMEOUT = 10*60  # seconds
 
 
-class KubernetesHTTPAdapter(requests.adapters.HTTPAdapter):
-
-    # _do_send: the actual send method of HTTPAdapter
-    # it can be overwritten in unit tests to mock the actual HTTP calls
-    _do_send = requests.adapters.HTTPAdapter.send
-
-    def __init__(self, kube_config: KubeConfig, **kwargs):
-        self.kube_config = kube_config
-
-        super().__init__(**kwargs)
-
-    def _persist_credentials(self, config, token, expiry):
-        user_name = config.contexts[config.current_context]["user"]
-        user = [u["user"] for u in config.doc["users"] if u["name"] == user_name][0]
-        auth_config = user["auth-provider"].setdefault("config", {})
-        auth_config["access-token"] = token
-        auth_config["expiry"] = expiry
-        config.persist_doc()
-        config.reload()
-
-    def _auth_gcp(self, request, token, expiry, config):
-        original_request = request.copy()
-
-        credentials = google.auth.default(
-            scopes=['https://www.googleapis.com/auth/cloud-platform', 'https://www.googleapis.com/auth/userinfo.email']
-        )[0]
-        credentials.token = token
-        credentials.expiry = expiry
-
-        should_persist = not credentials.valid
-
-        auth_request = GoogleAuthRequest()
-        credentials.before_request(auth_request, request.method, request.url, request.headers)
-
-        if should_persist and config:
-            self._persist_credentials(config, credentials.token, credentials.expiry)
-
-        def retry(send_kwargs):
-            credentials.refresh(auth_request)
-            response = self.send(original_request, **send_kwargs)
-            if response.ok and config:
-                self._persist_credentials(config, credentials.token, credentials.expiry)
-            return response
-
-        return retry
-
-    def send(self, request, **kwargs):
-        if "kube_config" in kwargs:
-            config = kwargs.pop("kube_config")
-        else:
-            config = self.kube_config
-
-        _retry_attempt = kwargs.pop("_retry_attempt", 0)
-        retry_func = None
-
-        # setup cluster API authentication
-
-        if "token" in config.user and config.user["token"]:
-            request.headers["Authorization"] = "Bearer {}".format(config.user["token"])
-        elif "auth-provider" in config.user:
-            auth_provider = config.user["auth-provider"]
-            if auth_provider.get("name") == "gcp":
-                dependencies = [
-                    google_auth_installed,
-                    jsonpath_installed,
-                ]
-                if not all(dependencies):
-                    raise ImportError("missing dependencies for GCP support (try pip install pykube-ng[gcp]")
-                auth_config = auth_provider.get("config", {})
-                if "cmd-path" in auth_config:
-                    output = subprocess.check_output(
-                        [auth_config["cmd-path"]] + shlex.split(auth_config["cmd-args"])
-                    )
-                    parsed = json.loads(output)
-                    token = jsonpath_parse(auth_config["token-key"], parsed)
-                    expiry = datetime.datetime.strptime(
-                        jsonpath_parse(auth_config["expiry-key"], parsed),
-                        "%Y-%m-%dT%H:%M:%SZ"
-                    )
-                    retry_func = self._auth_gcp(request, token, expiry, None)
-                else:
-                    retry_func = self._auth_gcp(
-                        request,
-                        auth_config.get("access-token"),
-                        auth_config.get("expiry"),
-                        config,
-                    )
-            # @@@ support oidc
-        elif "client-certificate" in config.user:
-            kwargs["cert"] = (
-                config.user["client-certificate"].filename(),
-                config.user["client-key"].filename(),
-            )
-        elif config.user.get("username") and config.user.get("password"):
-            request.prepare_auth((config.user["username"], config.user["password"]))
-
-        # setup certificate verification
-
-        if "certificate-authority" in config.cluster:
-            kwargs["verify"] = config.cluster["certificate-authority"].filename()
-        elif "insecure-skip-tls-verify" in config.cluster:
-            kwargs["verify"] = not config.cluster["insecure-skip-tls-verify"]
-
-        response = self._do_send(request, **kwargs)
-
-        _retry_status_codes = {HTTPStatus.UNAUTHORIZED}
-
-        if response.status_code in _retry_status_codes and retry_func and _retry_attempt < 2:
-            send_kwargs = {
-                "_retry_attempt": _retry_attempt + 1,
-                "kube_config": config,
-            }
-            send_kwargs.update(kwargs)
-            return retry_func(send_kwargs=send_kwargs)
-
-        return response
-
-
-class HTTPClient:
-    """
-    Client for interfacing with the Kubernetes API.
-    """
+class AsyncHTTPClient:
 
     def __init__(self, config: KubeConfig, timeout: float = DEFAULT_HTTP_TIMEOUT):
         """
-        Creates a new instance of the HTTPClient.
+        Creates a new instance of a client.
 
         :Parameters:
            - `config`: The configuration instance
         """
+        super().__init__()
         self.config = config
         self.timeout = timeout
         self.url = self.config.cluster["server"]
-
-        session = requests.Session()
-        session.headers['User-Agent'] = f'pykube-ng/{__version__}'
-        session.mount("https://", KubernetesHTTPAdapter(self.config))
-        session.mount("http://", KubernetesHTTPAdapter(self.config))
-        self.session = session
 
     @property
     def url(self):
@@ -177,24 +48,6 @@ class HTTPClient:
     def url(self, value):
         pr = urlparse(value)
         self._url = pr.geturl()
-
-    @property
-    def version(self):
-        """
-        Get Kubernetes API version
-        """
-        response = self.get(version="", base="/version")
-        response.raise_for_status()
-        data = response.json()
-        return (data["major"], data["minor"])
-
-    def resource_list(self, api_version):
-        cached_attr = f'_cached_resource_list_{api_version}'
-        if not hasattr(self, cached_attr):
-            r = self.get(version=api_version)
-            r.raise_for_status()
-            setattr(self, cached_attr, r.json())
-        return getattr(self, cached_attr)
 
     def get_kwargs(self, **kwargs) -> dict:
         """
@@ -234,21 +87,115 @@ class HTTPClient:
         if 'timeout' not in kwargs:
             # apply default HTTP timeout
             kwargs['timeout'] = self.timeout
+        if 'data' in kwargs:
+            kwargs.setdefault('headers', {}).setdefault('Content-Type', 'application/json')
         return kwargs
 
-    def raise_for_status(self, resp):
+    # TODO: put all abstract async-def methods here, just to have them.
+    @abc.abstractmethod
+    async def get(self, *args, **kwargs):
+        pass
+
+
+class SyncedHTTPClient(SyncWrapper, async_cls=AsyncHTTPClient):
+
+    def __init__(self, *args, **kwargs):
+        # if not isinstance(api, AsyncHTTPClient):
+        #     raise TypeError(f"Async client is expected as input; got {api!r}")
+
+        self.__lock = threading.Lock()
+        self.__loop = asyncio.new_event_loop()
+        self.__stop = asyncio.Event(loop=self.__loop)
+        self.__thread = threading.Thread(
+            name=f'pykube-{id(self)}',
+            target=self.__thread_for_loop,
+            kwargs=dict(loop=self.__loop, stop=self.__stop))
+
+        kwargs['loop'] = self.__loop
+        super().__init__(*args, **kwargs)
+        self.__start_thread()  # now or maybe lazily later
+
+    def __del__(self):
+        self._stop_thread()
+
+    def __start_thread(self):
+        # TODO: thread spawning is expensive. clients are re-created often. use a thread pool here.
+        with self.__lock:
+            if self.__thread is not None and not self.__thread.is_alive():
+                self.__thread.start()
+
+    def _stop_thread(self):
+        if self.__thread is not None and self.__thread.is_alive():
+            self.__loop.call_soon_threadsafe(self.__stop.set)
+            self.__thread.join()
+
+    # @staticmethod
+    def __thread_for_loop(self, loop: asyncio.AbstractEventLoop, stop: asyncio.Event):
+        # Assume that a fresh thread has no loop running already.
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(stop.wait())
+
+
+class AioHTTPClient(AsyncHTTPClient):
+    """
+    Client for interfacing with the Kubernetes API.
+    """
+
+    def __init__(self,
+                 config: KubeConfig,
+                 timeout: float = DEFAULT_HTTP_TIMEOUT,
+                 *,
+                 loop: Optional[asyncio.AbstractEventLoop] = None):
+        """
+        Creates a new instance of the HTTPClient.
+
+        :Parameters:
+           - `config`: The configuration instance
+        """
+        super().__init__(config=config, timeout=timeout)
+
+        # One client should fully run in one event-loop, with one conn-pool.
+        self._loop = loop if loop is not None else asyncio.get_event_loop()
+        self._sesion_future = asyncio.Future(loop=self._loop)
+
+        if loop is None:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = asyncio.get_event_loop()
+        loop.call_soon_threadsafe(self._lazy_session, self._sesion_future, config)
+
+    @property
+    async def version(self):
+        """
+        Get Kubernetes API version
+        """
+        response = await self.get(version="", base="/version")
+        response.raise_for_status()
+        data = await response.json()
+        return (data["major"], data["minor"])
+
+    async def resource_list(self, api_version):
+        cached_attr = f'_cached_resource_list_{api_version}'
+        if not hasattr(self, cached_attr):
+            r = await self.get(version=api_version)
+            r.raise_for_status()
+            setattr(self, cached_attr, await r.json())
+        return getattr(self, cached_attr)
+
+    async def raise_for_status(self, resp):
         try:
             resp.raise_for_status()
-        except Exception:
+        except Exception as e:
             # attempt to provide a more specific exception based around what
             # Kubernetes returned as the error.
             if resp.headers["content-type"] == "application/json":
-                payload = resp.json()
+                payload = await resp.json()
                 if payload["kind"] == "Status":
                     raise HTTPError(resp.status_code, payload["message"])
             raise
 
-    def request(self, *args, **kwargs):
+    async def request(self, *args, **kwargs):
         """
         Makes an API request based on arguments.
 
@@ -256,9 +203,10 @@ class HTTPClient:
            - `args`: Non-keyword arguments
            - `kwargs`: Keyword arguments
         """
-        return self.session.request(*args, **self.get_kwargs(**kwargs))
+        session = await self._sesion_future
+        return await session.request(*args, **self.get_kwargs(**kwargs))
 
-    def get(self, *args, **kwargs):
+    async def get(self, *args, **kwargs):
         """
         Executes an HTTP GET.
 
@@ -266,9 +214,10 @@ class HTTPClient:
            - `args`: Non-keyword arguments
            - `kwargs`: Keyword arguments
         """
-        return self.session.get(*args, **self.get_kwargs(**kwargs))
+        session = await self._sesion_future
+        return await session.get(*args, **self.get_kwargs(**kwargs))
 
-    def options(self, *args, **kwargs):
+    async def options(self, *args, **kwargs):
         """
         Executes an HTTP OPTIONS.
 
@@ -276,9 +225,10 @@ class HTTPClient:
            - `args`: Non-keyword arguments
            - `kwargs`: Keyword arguments
         """
-        return self.session.options(*args, **self.get_kwargs(**kwargs))
+        session = await self._sesion_future
+        return await session.options(*args, **self.get_kwargs(**kwargs))
 
-    def head(self, *args, **kwargs):
+    async def head(self, *args, **kwargs):
         """
         Executes an HTTP HEAD.
 
@@ -286,9 +236,10 @@ class HTTPClient:
            - `args`: Non-keyword arguments
            - `kwargs`: Keyword arguments
         """
-        return self.session.head(*args, **self.get_kwargs(**kwargs))
+        session = await self._sesion_future
+        return await session.head(*args, **self.get_kwargs(**kwargs))
 
-    def post(self, *args, **kwargs):
+    async def post(self, *args, **kwargs):
         """
         Executes an HTTP POST.
 
@@ -296,9 +247,10 @@ class HTTPClient:
            - `args`: Non-keyword arguments
            - `kwargs`: Keyword arguments
         """
-        return self.session.post(*args, **self.get_kwargs(**kwargs))
+        session = await self._sesion_future
+        return await session.post(*args, **self.get_kwargs(**kwargs))
 
-    def put(self, *args, **kwargs):
+    async def put(self, *args, **kwargs):
         """
         Executes an HTTP PUT.
 
@@ -306,9 +258,10 @@ class HTTPClient:
            - `args`: Non-keyword arguments
            - `kwargs`: Keyword arguments
         """
-        return self.session.put(*args, **self.get_kwargs(**kwargs))
+        session = await self._sesion_future
+        return await session.put(*args, **self.get_kwargs(**kwargs))
 
-    def patch(self, *args, **kwargs):
+    async def patch(self, *args, **kwargs):
         """
         Executes an HTTP PATCH.
 
@@ -316,9 +269,10 @@ class HTTPClient:
            - `args`: Non-keyword arguments
            - `kwargs`: Keyword arguments
         """
-        return self.session.patch(*args, **self.get_kwargs(**kwargs))
+        session = await self._sesion_future
+        return await session.patch(*args, **self.get_kwargs(**kwargs))
 
-    def delete(self, *args, **kwargs):
+    async def delete(self, *args, **kwargs):
         """
         Executes an HTTP DELETE.
 
@@ -326,4 +280,50 @@ class HTTPClient:
            - `args`: Non-keyword arguments
            - `kwargs`: Keyword arguments
         """
-        return self.session.delete(*args, **self.get_kwargs(**kwargs))
+        session = await self._sesion_future
+        return await session.delete(*args, **self.get_kwargs(**kwargs))
+
+    @staticmethod
+    def _lazy_session(future: asyncio.Future, config: KubeConfig):
+        """
+        Create an initialise an `aiohttp.ClientSession` for the client.
+
+        Objects of `aiohttp` must be created inside of a running loop.
+        And closed there too.
+
+        But objects of this class can be created outside of the loop,
+        despite the loop is provided to them as an argument.
+
+        So, we schedule the session creation as soon as the client is created,
+        or slightly after that -- as soon as the loop takes the next iteration.
+
+        All requesting methods (get/post/patch/delete/etc) first wait
+        for the session to be defined (via a session future),
+        and use it only after that. It usually happens instantly.
+        """
+        conn = None
+        cafile = None
+        headers = {}
+
+        if "certificate-authority" in config.cluster:
+            cafile = config.cluster["certificate-authority"].filename()
+        # elif "insecure-skip-tls-verify" in self.config.cluster:
+        #     kwargs["verify"] = not config.cluster["insecure-skip-tls-verify"]
+
+        if "token" in config.user and config.user["token"]:
+            headers["Authorization"] = "Bearer {}".format(config.user["token"])
+        elif "client-certificate" in config.user:
+            cert_file = config.user["client-certificate"].filename()
+            client_key = config.user["client-key"].filename()
+            sslcontext = ssl.create_default_context(purpose=ssl.Purpose.CLIENT_AUTH, cafile=cafile)
+            sslcontext.load_cert_chain(certfile=cert_file, keyfile=client_key)
+            conn = aiohttp.TCPConnector(ssl_context=sslcontext, limit=0)
+
+        session = aiohttp.ClientSession(connector=conn, headers=headers)
+        future.set_result(session)
+
+
+# Backward compatibility: a synchronous (actually, synchronised) client with
+# some default asynchronous implementation under the hood (any is suitable).
+class HTTPClient(SyncedHTTPClient, async_cls=AioHTTPClient):
+    pass
