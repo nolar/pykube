@@ -345,9 +345,7 @@ def test_patch_subresource(api, requests_mock):
         rsps.add(
             responses.GET,
             "https://localhost:9443/apis/apps/v1/namespaces/default/deployments",
-            json={
-                "items": [{"metadata": {"name": "deploy-1"}}]
-            },
+            json={"items": [{"metadata": {"name": "deploy-1"}}]},
         )
 
         deployments = list(Deployment.objects(api))
@@ -359,13 +357,10 @@ def test_patch_subresource(api, requests_mock):
         rsps.add(
             responses.PATCH,
             "https://localhost:9443/apis/apps/v1/namespaces/default/deployments/deploy-1/status",
-            json={
-                "metadata": {"name": "deploy-1"},
-                "status": {"field": "field"},
-            },
+            json={"metadata": {"name": "deploy-1"}, "status": {"field": "field"}},
         )
 
-        deploy.patch({"status": {"field": "field"}}, subresource='status')
+        deploy.patch({"status": {"field": "field"}}, subresource="status")
         assert len(rsps.calls) == 2
 
         assert json.loads(rsps.calls[-1].request.body) == {

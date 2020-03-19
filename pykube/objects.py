@@ -96,7 +96,9 @@ class APIObject:
         else:
             subresource = kwargs.pop("subresource", None) or ""
             operation = kwargs.pop("operation", "")
-            kw["url"] = op.normpath(op.join(self.endpoint, self.name, subresource, operation))
+            kw["url"] = op.normpath(
+                op.join(self.endpoint, self.name, subresource, operation)
+            )
         params = kwargs.pop("params", None)
         if params is not None:
             query_string = urlencode(params)
